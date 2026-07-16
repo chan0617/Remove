@@ -36,7 +36,7 @@ export const DEFAULT_PROCESS_OPTIONS: ProcessOptions = {
   autoCrop: false,
   keepOriginalSize: true,
   removeShadow: false,
-  featherPx: 1,
+  featherPx: 0,
 };
 
 export const ACCEPTED_MIME_TYPES = [

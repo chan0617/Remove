@@ -7,9 +7,12 @@ import {
   applyShadowMode,
   autoCropTransparent,
   cropToRegion,
+  decontaminateEdges,
+  estimateBackgroundColor,
   featherAlpha,
   getImageDimensions,
   padForInference,
+  sharpenAlphaEdge,
 } from "@/lib/imageUtils";
 import {
   ACCEPTED_MIME_TYPES,
@@ -42,6 +45,10 @@ function ensureModelPreloaded(
   }
   return modelPreloadPromise;
 }
+
+// How far (px) to erode the cutout edge inward to remove the hazy/soft
+// fringe that matting models leave at the boundary.
+const EDGE_ERODE_PX = 1;
 
 function makeId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -102,6 +109,14 @@ export function useBackgroundRemoval() {
         padded.originalWidth,
         padded.originalHeight,
       );
+
+      // Clean up the hazy/whitish fringe matting models leave on edges:
+      // recover the true foreground color on semi-transparent boundary
+      // pixels, then erode + contrast the alpha so the cut looks crisp
+      // instead of soft.
+      const bgColor = await estimateBackgroundColor(job.file);
+      result = await decontaminateEdges(result, bgColor);
+      result = await sharpenAlphaEdge(result, EDGE_ERODE_PX);
 
       result = await applyShadowMode(result, opts.removeShadow);
 

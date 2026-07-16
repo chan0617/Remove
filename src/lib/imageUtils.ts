@@ -217,6 +217,168 @@ export async function featherAlpha(
   );
 }
 
+function clamp255(v: number): number {
+  return Math.max(0, Math.min(255, Math.round(v)));
+}
+
+/**
+ * Estimates the studio/background color by sampling the corners and edge
+ * midpoints of the *original* (pre-matting) photo. Used to undo color
+ * contamination on semi-transparent cutout edges.
+ */
+export async function estimateBackgroundColor(
+  source: File | Blob,
+): Promise<[number, number, number]> {
+  const bitmap = await createImageBitmap(source);
+  const { width, height } = bitmap;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d")!;
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+
+  const points: [number, number][] = [
+    [2, 2],
+    [width - 3, 2],
+    [2, height - 3],
+    [width - 3, height - 3],
+    [Math.floor(width / 2), 2],
+    [2, Math.floor(height / 2)],
+  ];
+
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  for (const [x, y] of points) {
+    const d = ctx.getImageData(x, y, 1, 1).data;
+    r += d[0];
+    g += d[1];
+    b += d[2];
+  }
+  const n = points.length;
+  return [r / n, g / n, b / n];
+}
+
+/**
+ * Undoes color contamination on the cutout's semi-transparent boundary
+ * pixels. Matting output blends foreground and background color together at
+ * partial-alpha edges (`observed = fg*a + bg*(1-a)`), which is what causes a
+ * hazy/whitish halo when composited elsewhere. This inverts that blend to
+ * recover the pure foreground color at each edge pixel.
+ */
+export async function decontaminateEdges(
+  blob: Blob,
+  background: [number, number, number],
+): Promise<Blob> {
+  const bitmap = await createImageBitmap(blob);
+  const { width, height } = bitmap;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d")!;
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+
+  const imageData = ctx.getImageData(0, 0, width, height);
+  const data = imageData.data;
+  const [br, bg, bb] = background;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const a = data[i + 3];
+    if (a > 0 && a < 250) {
+      const alphaF = Math.max(a / 255, 0.12);
+      data[i] = clamp255((data[i] - (1 - alphaF) * br) / alphaF);
+      data[i + 1] = clamp255((data[i + 1] - (1 - alphaF) * bg) / alphaF);
+      data[i + 2] = clamp255((data[i + 2] - (1 - alphaF) * bb) / alphaF);
+    }
+  }
+  ctx.putImageData(imageData, 0, 0);
+
+  return new Promise((resolve) =>
+    canvas.toBlob((b) => resolve(b!), "image/png"),
+  );
+}
+
+/**
+ * Produces a crisp, "fully cut out" edge: erodes the alpha mask inward by
+ * `erodePx` (a min-filter, so any pixel near a transparent neighbor is
+ * dropped) to remove the soft/hazy transition band the model leaves behind,
+ * then applies a contrast curve so the remaining edge snaps to a narrow
+ * 1px anti-aliasing ramp instead of a wide gradient.
+ */
+export async function sharpenAlphaEdge(
+  blob: Blob,
+  erodePx = 1,
+): Promise<Blob> {
+  const bitmap = await createImageBitmap(blob);
+  const { width, height } = bitmap;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d")!;
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+
+  const imageData = ctx.getImageData(0, 0, width, height);
+  const data = imageData.data;
+  const n = width * height;
+
+  const alpha = new Uint8ClampedArray(n);
+  for (let i = 0; i < n; i++) alpha[i] = data[i * 4 + 3];
+
+  const r = Math.max(1, Math.round(erodePx));
+
+  // Separable min-filter (box erosion): horizontal pass, then vertical pass.
+  const horizontal = new Uint8ClampedArray(n);
+  for (let y = 0; y < height; y++) {
+    const rowOffset = y * width;
+    for (let x = 0; x < width; x++) {
+      let m = 255;
+      const xs = Math.max(0, x - r);
+      const xe = Math.min(width - 1, x + r);
+      for (let xx = xs; xx <= xe; xx++) {
+        const v = alpha[rowOffset + xx];
+        if (v < m) m = v;
+      }
+      horizontal[rowOffset + x] = m;
+    }
+  }
+
+  const eroded = new Uint8ClampedArray(n);
+  for (let x = 0; x < width; x++) {
+    for (let y = 0; y < height; y++) {
+      let m = 255;
+      const ys = Math.max(0, y - r);
+      const ye = Math.min(height - 1, y + r);
+      for (let yy = ys; yy <= ye; yy++) {
+        const v = horizontal[yy * width + x];
+        if (v < m) m = v;
+      }
+      eroded[y * width + x] = m;
+    }
+  }
+
+  // Contrast curve centered on the midtone: snaps confident foreground/
+  // background pixels to fully opaque/transparent while keeping a thin
+  // anti-aliasing ramp right at the boundary.
+  const low = 0.35;
+  const high = 0.75;
+  for (let i = 0; i < n; i++) {
+    const a = eroded[i] / 255;
+    let sharpened: number;
+    if (a <= low) sharpened = 0;
+    else if (a >= high) sharpened = 1;
+    else sharpened = (a - low) / (high - low);
+    data[i * 4 + 3] = Math.round(sharpened * 255);
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+  return new Promise((resolve) =>
+    canvas.toBlob((b) => resolve(b!), "image/png"),
+  );
+}
+
 /**
  * Renders the cutout on a solid background for preview/export. Transparent
  * stays untouched (returns the original blob).
