@@ -50,6 +50,12 @@ function ensureModelPreloaded(
 // fringe that matting models leave at the boundary.
 const EDGE_ERODE_PX = 1;
 
+// Each job runs a full ONNX inference session in-browser (WASM/WebGPU).
+// Firing all jobs at once for a large batch exhausts tab memory and stalls
+// every job mid-progress (and re-uploading the same batch after a refresh
+// hits the same wall), so only a few run at a time.
+const MAX_CONCURRENT_JOBS = 2;
+
 function makeId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
@@ -69,6 +75,8 @@ export function useBackgroundRemoval() {
   const [modelError, setModelError] = useState<string | null>(null);
   const jobsRef = useRef<ImageJob[]>([]);
   jobsRef.current = jobs;
+  const queueRef = useRef<{ job: ImageJob; opts: ProcessOptions }[]>([]);
+  const activeCountRef = useRef(0);
 
   const updateJob = useCallback((id: string, patch: Partial<ImageJob>) => {
     setJobs((prev) =>
@@ -149,6 +157,29 @@ export function useBackgroundRemoval() {
     }
   }, [updateJob]);
 
+  const pumpQueue = useCallback(() => {
+    while (
+      activeCountRef.current < MAX_CONCURRENT_JOBS &&
+      queueRef.current.length > 0
+    ) {
+      const next = queueRef.current.shift();
+      if (!next) break;
+      activeCountRef.current += 1;
+      void processFile(next.job, next.opts).finally(() => {
+        activeCountRef.current -= 1;
+        pumpQueue();
+      });
+    }
+  }, [processFile]);
+
+  const enqueueJob = useCallback(
+    (job: ImageJob, opts: ProcessOptions) => {
+      queueRef.current.push({ job, opts });
+      pumpQueue();
+    },
+    [pumpQueue],
+  );
+
   const addFiles = useCallback(
     (files: File[]) => {
       const accepted: ImageJob[] = [];
@@ -177,21 +208,21 @@ export function useBackgroundRemoval() {
       if (accepted.length > 0) {
         setJobs((prev) => [...prev, ...accepted]);
         for (const job of accepted) {
-          void processFile(job, options);
+          enqueueJob(job, options);
         }
       }
 
       return { accepted: accepted.length, rejected };
     },
-    [options, processFile],
+    [options, enqueueJob],
   );
 
   const retryJob = useCallback(
     (id: string) => {
       const job = jobsRef.current.find((j) => j.id === id);
-      if (job) void processFile(job, options);
+      if (job) enqueueJob(job, options);
     },
-    [options, processFile],
+    [options, enqueueJob],
   );
 
   const removeJob = useCallback((id: string) => {
