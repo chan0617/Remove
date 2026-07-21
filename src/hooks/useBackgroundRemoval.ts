@@ -8,10 +8,10 @@ import {
   autoCropTransparent,
   cropToRegion,
   decontaminateEdges,
-  estimateBackgroundColor,
   featherAlpha,
   getImageDimensions,
   padForInference,
+  sampleBackgroundColors,
   sharpenAlphaEdge,
 } from "@/lib/imageUtils";
 import {
@@ -122,8 +122,8 @@ export function useBackgroundRemoval() {
       // recover the true foreground color on semi-transparent boundary
       // pixels, then erode + contrast the alpha so the cut looks crisp
       // instead of soft.
-      const bgColor = await estimateBackgroundColor(job.file);
-      result = await decontaminateEdges(result, bgColor);
+      const bgSamples = await sampleBackgroundColors(job.file, result);
+      result = await decontaminateEdges(result, bgSamples);
       result = await sharpenAlphaEdge(result, EDGE_ERODE_PX);
 
       result = await applyShadowMode(result, opts.removeShadow);

@@ -221,55 +221,133 @@ function clamp255(v: number): number {
   return Math.max(0, Math.min(255, Math.round(v)));
 }
 
+interface BackgroundSample {
+  x: number;
+  y: number;
+  r: number;
+  g: number;
+  b: number;
+}
+
 /**
- * Estimates the studio/background color by sampling the corners and edge
- * midpoints of the *original* (pre-matting) photo. Used to undo color
- * contamination on semi-transparent cutout edges.
+ * Samples background color at many grid points across the *original*
+ * (pre-matting) photo, keeping only points the matte marks as pure
+ * background. Studio backdrops are rarely one flat color — product/pet
+ * photography backdrops are commonly a white-to-blue-gray vignette — so a
+ * single global average under/over-corrects depending on where on the
+ * gradient a given edge pixel actually sits. These spatial samples let
+ * decontamination interpolate a local estimate per pixel instead.
  */
-export async function estimateBackgroundColor(
-  source: File | Blob,
-): Promise<[number, number, number]> {
-  const bitmap = await createImageBitmap(source);
-  const { width, height } = bitmap;
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext("2d")!;
-  ctx.drawImage(bitmap, 0, 0);
-  bitmap.close();
+export async function sampleBackgroundColors(
+  original: File | Blob,
+  matted: Blob,
+): Promise<BackgroundSample[]> {
+  const [origBitmap, mattedBitmap] = await Promise.all([
+    createImageBitmap(original),
+    createImageBitmap(matted),
+  ]);
+  const { width, height } = mattedBitmap;
 
-  const points: [number, number][] = [
-    [2, 2],
-    [width - 3, 2],
-    [2, height - 3],
-    [width - 3, height - 3],
-    [Math.floor(width / 2), 2],
-    [2, Math.floor(height / 2)],
-  ];
+  const origCanvas = document.createElement("canvas");
+  origCanvas.width = width;
+  origCanvas.height = height;
+  const origCtx = origCanvas.getContext("2d")!;
+  origCtx.drawImage(origBitmap, 0, 0, width, height);
+  const origData = origCtx.getImageData(0, 0, width, height).data;
 
-  let r = 0;
-  let g = 0;
-  let b = 0;
-  for (const [x, y] of points) {
-    const d = ctx.getImageData(x, y, 1, 1).data;
-    r += d[0];
-    g += d[1];
-    b += d[2];
+  const mattedCanvas = document.createElement("canvas");
+  mattedCanvas.width = width;
+  mattedCanvas.height = height;
+  const mattedCtx = mattedCanvas.getContext("2d")!;
+  mattedCtx.drawImage(mattedBitmap, 0, 0);
+  const alphaData = mattedCtx.getImageData(0, 0, width, height).data;
+
+  origBitmap.close();
+  mattedBitmap.close();
+
+  // Aim for a bounded sample count regardless of image resolution, so
+  // interpolation cost stays predictable.
+  const gridStep = Math.max(
+    16,
+    Math.round(Math.sqrt((width * height) / 600)),
+  );
+  const alphaThreshold = 6;
+
+  const samples: BackgroundSample[] = [];
+  for (let gy = 0; gy < height; gy += gridStep) {
+    for (let gx = 0; gx < width; gx += gridStep) {
+      const i = (gy * width + gx) * 4;
+      if (alphaData[i + 3] <= alphaThreshold) {
+        samples.push({
+          x: gx,
+          y: gy,
+          r: origData[i],
+          g: origData[i + 1],
+          b: origData[i + 2],
+        });
+      }
+    }
   }
-  const n = points.length;
-  return [r / n, g / n, b / n];
+
+  // Subject fills the frame with no clean background grid points — fall
+  // back to the corners so decontamination still has something to use.
+  if (samples.length === 0) {
+    const corners: [number, number][] = [
+      [2, 2],
+      [width - 3, 2],
+      [2, height - 3],
+      [width - 3, height - 3],
+    ];
+    for (const [x, y] of corners) {
+      const i = (y * width + x) * 4;
+      samples.push({
+        x,
+        y,
+        r: origData[i],
+        g: origData[i + 1],
+        b: origData[i + 2],
+      });
+    }
+  }
+
+  return samples;
+}
+
+function interpolateBackground(
+  samples: BackgroundSample[],
+  x: number,
+  y: number,
+): [number, number, number] {
+  let wSum = 0;
+  let rSum = 0;
+  let gSum = 0;
+  let bSum = 0;
+  for (const s of samples) {
+    const dx = s.x - x;
+    const dy = s.y - y;
+    // +64 caps the weight of near-coincident samples so one lucky sample
+    // doesn't dominate the estimate.
+    const w = 1 / (dx * dx + dy * dy + 64);
+    wSum += w;
+    rSum += s.r * w;
+    gSum += s.g * w;
+    bSum += s.b * w;
+  }
+  return [rSum / wSum, gSum / wSum, bSum / wSum];
 }
 
 /**
  * Undoes color contamination on the cutout's semi-transparent boundary
  * pixels. Matting output blends foreground and background color together at
  * partial-alpha edges (`observed = fg*a + bg*(1-a)`), which is what causes a
- * hazy/whitish halo when composited elsewhere. This inverts that blend to
- * recover the pure foreground color at each edge pixel.
+ * hazy/whitish (or background-tinted) halo when composited elsewhere. This
+ * inverts that blend to recover the pure foreground color at each edge
+ * pixel, using a locally-interpolated background estimate rather than one
+ * flat color so gradient/vignette backdrops decontaminate correctly too.
  */
 export async function decontaminateEdges(
   blob: Blob,
-  background: [number, number, number],
+  backgroundSamples: BackgroundSample[],
 ): Promise<Blob> {
   const bitmap = await createImageBitmap(blob);
   const { width, height } = bitmap;
@@ -282,15 +360,18 @@ export async function decontaminateEdges(
 
   const imageData = ctx.getImageData(0, 0, width, height);
   const data = imageData.data;
-  const [br, bg, bb] = background;
 
-  for (let i = 0; i < data.length; i += 4) {
-    const a = data[i + 3];
-    if (a > 0 && a < 250) {
-      const alphaF = Math.max(a / 255, 0.12);
-      data[i] = clamp255((data[i] - (1 - alphaF) * br) / alphaF);
-      data[i + 1] = clamp255((data[i + 1] - (1 - alphaF) * bg) / alphaF);
-      data[i + 2] = clamp255((data[i + 2] - (1 - alphaF) * bb) / alphaF);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      const a = data[i + 3];
+      if (a > 0 && a < 250) {
+        const [br, bg, bb] = interpolateBackground(backgroundSamples, x, y);
+        const alphaF = Math.max(a / 255, 0.12);
+        data[i] = clamp255((data[i] - (1 - alphaF) * br) / alphaF);
+        data[i + 1] = clamp255((data[i + 1] - (1 - alphaF) * bg) / alphaF);
+        data[i + 2] = clamp255((data[i + 2] - (1 - alphaF) * bb) / alphaF);
+      }
     }
   }
   ctx.putImageData(imageData, 0, 0);
