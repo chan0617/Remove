@@ -361,16 +361,30 @@ export async function decontaminateEdges(
   const imageData = ctx.getImageData(0, 0, width, height);
   const data = imageData.data;
 
+  // Below this, dividing by alphaF to invert the blend amplifies any small
+  // error in the background estimate into a wildly saturated wrong color
+  // (a pixel that's 90%+ background shows the tiniest bg mis-estimate
+  // magnified 10x+). These pixels contribute almost nothing to the final
+  // composite anyway, so just use the estimated background color directly
+  // instead of guessing at a foreground color from mostly-background data.
+  const minAlphaF = 0.2;
+
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const i = (y * width + x) * 4;
       const a = data[i + 3];
       if (a > 0 && a < 250) {
         const [br, bg, bb] = interpolateBackground(backgroundSamples, x, y);
-        const alphaF = Math.max(a / 255, 0.12);
-        data[i] = clamp255((data[i] - (1 - alphaF) * br) / alphaF);
-        data[i + 1] = clamp255((data[i + 1] - (1 - alphaF) * bg) / alphaF);
-        data[i + 2] = clamp255((data[i + 2] - (1 - alphaF) * bb) / alphaF);
+        const alphaF = a / 255;
+        if (alphaF <= minAlphaF) {
+          data[i] = br;
+          data[i + 1] = bg;
+          data[i + 2] = bb;
+        } else {
+          data[i] = clamp255((data[i] - (1 - alphaF) * br) / alphaF);
+          data[i + 1] = clamp255((data[i + 1] - (1 - alphaF) * bg) / alphaF);
+          data[i + 2] = clamp255((data[i + 2] - (1 - alphaF) * bb) / alphaF);
+        }
       }
     }
   }
@@ -386,11 +400,18 @@ export async function decontaminateEdges(
  * `erodePx` (a min-filter, so any pixel near a transparent neighbor is
  * dropped) to remove the soft/hazy transition band the model leaves behind,
  * then applies a contrast curve so the remaining edge snaps to a narrow
- * 1px anti-aliasing ramp instead of a wide gradient.
+ * anti-aliasing ramp instead of a wide gradient.
+ *
+ * (A guided-image-filter alpha refinement was tried here instead of erosion,
+ * to preserve fine fur/hair detail — but without a proper trimap it produced
+ * a halo ring around the whole silhouette, which looked worse than the loss
+ * of fur detail this erosion trades away. Reverted.)
  */
 export async function sharpenAlphaEdge(
   blob: Blob,
   erodePx = 1,
+  low = 0.35,
+  high = 0.75,
 ): Promise<Blob> {
   const bitmap = await createImageBitmap(blob);
   const { width, height } = bitmap;
@@ -443,8 +464,6 @@ export async function sharpenAlphaEdge(
   // Contrast curve centered on the midtone: snaps confident foreground/
   // background pixels to fully opaque/transparent while keeping a thin
   // anti-aliasing ramp right at the boundary.
-  const low = 0.35;
-  const high = 0.75;
   for (let i = 0; i < n; i++) {
     const a = eroded[i] / 255;
     let sharpened: number;

@@ -48,7 +48,7 @@ function ensureModelPreloaded(
 
 // How far (px) to erode the cutout edge inward to remove the hazy/soft
 // fringe that matting models leave at the boundary.
-const EDGE_ERODE_PX = 1;
+const EDGE_ERODE_PX = 2;
 
 // Each job runs a full ONNX inference session in-browser (WASM/WebGPU).
 // Firing all jobs at once for a large batch exhausts tab memory and stalls
@@ -118,13 +118,16 @@ export function useBackgroundRemoval() {
         padded.originalHeight,
       );
 
-      // Clean up the hazy/whitish fringe matting models leave on edges:
-      // recover the true foreground color on semi-transparent boundary
-      // pixels, then erode + contrast the alpha so the cut looks crisp
-      // instead of soft.
+      // Clean up the hazy/whitish fringe matting models leave on edges.
+      // Alpha must be finalized *before* decontaminating color: the color
+      // unmix formula divides by the alpha at each pixel, so if alpha
+      // changed afterward the two would go out of sync and background
+      // color would leak back in. So: erode + snap alpha first, then
+      // unmix color against that final alpha.
+      result = await sharpenAlphaEdge(result, EDGE_ERODE_PX);
+
       const bgSamples = await sampleBackgroundColors(job.file, result);
       result = await decontaminateEdges(result, bgSamples);
-      result = await sharpenAlphaEdge(result, EDGE_ERODE_PX);
 
       result = await applyShadowMode(result, opts.removeShadow);
 
